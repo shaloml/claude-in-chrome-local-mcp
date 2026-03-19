@@ -573,6 +573,31 @@ class MCPServer:
             if "tabGroupId" not in tool_args and self.tab_group_id is not None:
                 tool_args["tabGroupId"] = self.tab_group_id
 
+        # Auto-inject action parameter for tools that require it.
+        # The Chrome extension's "computer" tool needs an action to distinguish
+        # between click, type, scroll, and screenshot operations.
+        # The "javascript_tool" requires action: "javascript_exec".
+        ACTION_MAP = {
+            "browser_screen_capture": "screenshot",
+            "browser_js_eval": "javascript_exec",
+            "browser_click": "click",
+            "browser_type": "type",
+            "browser_scroll": "scroll",
+        }
+        if tool_name in ACTION_MAP and "action" not in tool_args:
+            tool_args["action"] = ACTION_MAP[tool_name]
+
+        # Rename parameters to match Chrome extension expectations.
+        # The extension's javascript_tool expects "text" for the code content,
+        # but the MCP schema exposes it as "code" for better clarity.
+        PARAM_RENAME_MAP = {
+            "browser_js_eval": {"code": "text"},
+        }
+        if tool_name in PARAM_RENAME_MAP:
+            for old_key, new_key in PARAM_RENAME_MAP[tool_name].items():
+                if old_key in tool_args and new_key not in tool_args:
+                    tool_args[new_key] = tool_args.pop(old_key)
+
         self.request_counter += 1
         req_key = self.request_counter
 
@@ -621,7 +646,24 @@ class MCPServer:
                 content = tool_result
 
             if isinstance(content, list):
-                mcp_content = content
+                # Translate Chrome extension content format to MCP format.
+                # The extension returns images as:
+                #   {"type": "image", "source": {"type": "base64", "media_type": "...", "data": "..."}}
+                # MCP expects:
+                #   {"type": "image", "data": "...", "mimeType": "..."}
+                mcp_content = []
+                for item in content:
+                    if (isinstance(item, dict)
+                            and item.get("type") == "image"
+                            and "source" in item):
+                        source = item["source"]
+                        mcp_content.append({
+                            "type": "image",
+                            "data": source.get("data", ""),
+                            "mimeType": source.get("media_type", "image/png"),
+                        })
+                    else:
+                        mcp_content.append(item)
             elif isinstance(content, str):
                 mcp_content = [{"type": "text", "text": content}]
             else:
