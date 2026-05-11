@@ -62,23 +62,9 @@ STALE_TAB_ERROR_MARKERS = (
     "tabGroupId not found",
 )
 
-# MCP tool name -> Chrome extension internal tool name mapping.
-# The extension uses short names internally while the MCP interface
-# exposes "browser_*" names for Claude Code compatibility.
-TOOL_NAME_MAP = {
-    "browser_navigate": "navigate",
-    "browser_click": "computer",
-    "browser_type": "computer",
-    "browser_snapshot": "read_page",
-    "browser_scroll": "computer",
-    "browser_tab_list": "tabs_context_mcp",
-    "browser_tab_switch": "navigate",
-    "browser_tab_close": "tabs_context",
-    "browser_tab_new": "tabs_create_mcp",
-    "browser_screen_capture": "computer",
-    "browser_console_messages": "read_console_messages",
-    "browser_js_eval": "javascript_tool",
-}
+# Chrome-extension tools that do NOT accept a "tabId" argument. Everything else
+# does, and the bridge auto-injects the active tab's id when the caller omits it.
+NO_TABID_TOOLS = frozenset({"tabs_context_mcp", "tabs_create_mcp"})
 
 # Known browser tools provided by the Chrome extension.
 # These are the tools that "Claude in Chrome" exposes for browser control.
@@ -96,18 +82,20 @@ BROWSER_TOOLS = [
     },
     {
         "name": "browser_click",
-        "description": "Click on an element in the browser page",
+        "description": "Click an element in the browser page. Provide a 'ref' from browser_snapshot, a CSS 'selector', or explicit 'x'/'y' pixel coordinates.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "selector": {
-                    "type": "string",
-                    "description": "CSS selector or descriptive text to identify the element to click",
-                },
                 "ref": {
                     "type": "string",
-                    "description": "Reference ID of the element to click (from a previous snapshot)",
+                    "description": "Reference ID of the element to click (from a browser_snapshot)",
                 },
+                "selector": {
+                    "type": "string",
+                    "description": "CSS selector of the element to click",
+                },
+                "x": {"type": "number", "description": "X pixel coordinate to click (use together with 'y')"},
+                "y": {"type": "number", "description": "Y pixel coordinate to click (use together with 'x')"},
             },
         },
     },
@@ -227,26 +215,30 @@ BROWSER_TOOLS = [
     },
     {
         "name": "browser_console_messages",
-        "description": "Get recent console messages from the browser",
+        "description": "Read recent console messages (log/warn/error) from the current browser tab",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "count": {
-                    "type": "number",
-                    "description": "Number of recent messages to return (default: 20)",
-                }
+                "onlyErrors": {
+                    "type": "boolean",
+                    "description": "Only return errors and exceptions (default: false)",
+                },
+                "pattern": {
+                    "type": "string",
+                    "description": "Regex to filter messages (recommended, to avoid very large output)",
+                },
             },
         },
     },
     {
         "name": "browser_js_eval",
-        "description": "Execute JavaScript code in the browser page",
+        "description": "Execute JavaScript in the current page's context. Returns the value of the LAST expression -- write an expression, not a 'return' statement (e.g. 'document.title', not 'return document.title').",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "code": {
                     "type": "string",
-                    "description": "JavaScript code to execute",
+                    "description": "JavaScript expression to evaluate in the page",
                 }
             },
             "required": ["code"],
@@ -487,13 +479,168 @@ class MCPServer:
         self.tab_group_id = None
         self.tab_group_initialized = False
 
-    def _inject_tab_args(self, internal_name: str, tool_args: dict) -> None:
-        """Auto-inject the active tabId / tabGroupId into a tool call's args."""
-        if "tabId" not in tool_args and self.active_tab_id is not None:
-            tool_args["tabId"] = self.active_tab_id
-        if internal_name in ("tabs_context_mcp", "tabs_create_mcp", "tabs_context"):
-            if "tabGroupId" not in tool_args and self.tab_group_id is not None:
-                tool_args["tabGroupId"] = self.tab_group_id
+    def _inject_tab_id(self, internal_name: str, tool_args: dict) -> dict:
+        """Return a copy of tool_args with the active tabId injected when needed."""
+        out = dict(tool_args)
+        if internal_name not in NO_TABID_TOOLS and "tabId" not in out and self.active_tab_id is not None:
+            out["tabId"] = self.active_tab_id
+        return out
+
+    # -- MCP tool -> Chrome extension tool translation ------------------------
+
+    @staticmethod
+    def _text_result(text: str) -> dict:
+        """An MCP tool result carrying a plain text message."""
+        return {"content": [{"type": "text", "text": text}]}
+
+    @staticmethod
+    def _error_result(text: str) -> dict:
+        """An MCP tool result flagged as an error."""
+        return {"content": [{"type": "text", "text": f"Error: {text}"}], "isError": True}
+
+    @staticmethod
+    def _js_call(expr: str) -> tuple:
+        """A javascript_tool call that evaluates a single JS expression."""
+        return ("javascript_tool", {"action": "javascript_exec", "text": expr})
+
+    def _translate_call(self, mcp_name: str, args: dict):
+        """Translate an MCP browser_* call into Chrome-extension tool call(s).
+
+        Returns (calls, local_result):
+          - calls: list of (internal_tool_name, internal_args) to run in order;
+            the result of the last one is returned to the MCP client.
+          - local_result: if not None, an MCP result dict to return directly
+            without contacting the extension (and `calls` is ignored).
+        """
+        a = dict(args or {})
+
+        if mcp_name == "browser_navigate":
+            return [("navigate", {"url": a.get("url")})], None
+
+        if mcp_name == "browser_tab_list":
+            return [("tabs_context_mcp", {})], None
+
+        if mcp_name == "browser_tab_new":
+            calls = [("tabs_create_mcp", {})]
+            if a.get("url"):
+                # navigate runs on the freshly-created (now active) tab
+                calls.append(("navigate", {"url": a["url"]}))
+            return calls, None
+
+        if mcp_name == "browser_tab_close":
+            tab_id = a.get("tabId", self.active_tab_id)
+            if tab_id is None:
+                return [], self._error_result("browser_tab_close requires a tabId")
+            return [("tabs_close_mcp", {"tabId": int(tab_id)})], None
+
+        if mcp_name == "browser_tab_switch":
+            tab_id = a.get("tabId")
+            if tab_id is None:
+                return [], self._error_result("browser_tab_switch requires a tabId")
+            self.active_tab_id = int(tab_id)
+            return [], self._text_result(f"Active tab set to {tab_id}")
+
+        if mcp_name == "browser_snapshot":
+            ia = {}
+            if a.get("filter") in ("interactive", "all"):
+                ia["filter"] = a["filter"]
+            return [("read_page", ia)], None
+
+        if mcp_name == "browser_console_messages":
+            ia = {}
+            if a.get("onlyErrors"):
+                ia["onlyErrors"] = True
+            if a.get("pattern"):
+                ia["pattern"] = a["pattern"]
+            return [("read_console_messages", ia)], None
+
+        if mcp_name == "browser_js_eval":
+            return [self._js_call(a.get("code", ""))], None
+
+        if mcp_name == "browser_screen_capture":
+            return [("computer", {"action": "screenshot"})], None
+
+        if mcp_name == "browser_scroll":
+            # `computer` scroll needs pixel coordinates; doing it in-page is simpler.
+            direction = a.get("direction", "down")
+            amount = a.get("amount")
+            axis = "1" if direction in ("up", "down") else "0"
+            default = "window.innerHeight" if direction in ("up", "down") else "window.innerWidth"
+            magnitude = str(int(amount)) if amount else default
+            sign = "-" if direction in ("up", "left") else ""
+            dx, dy = (f"{sign}{magnitude}", "0") if axis == "0" else ("0", f"{sign}{magnitude}")
+            expr = (f"(function(){{window.scrollBy({dx}, {dy});"
+                    f"return 'scrolled {direction} (now at x='+Math.round(window.scrollX)"
+                    f"+', y='+Math.round(window.scrollY)+')';}})()")
+            return [self._js_call(expr)], None
+
+        if mcp_name == "browser_click":
+            if a.get("ref"):
+                return [("computer", {"action": "left_click", "ref": a["ref"]})], None
+            if a.get("x") is not None and a.get("y") is not None:
+                return [("computer", {"action": "left_click",
+                                      "coordinate": [a["x"], a["y"]]})], None
+            if a.get("selector"):
+                sel = json.dumps(a["selector"])
+                expr = (f"(function(){{var el=document.querySelector({sel});"
+                        f"if(!el)throw new Error('Element not found: '+{sel});"
+                        f"el.scrollIntoView({{block:'center',inline:'center'}});el.click();"
+                        f"return 'clicked '+el.tagName.toLowerCase();}})()")
+                return [self._js_call(expr)], None
+            return [], self._error_result("browser_click requires 'ref', 'selector', or 'x'+'y'")
+
+        if mcp_name == "browser_type":
+            text = a.get("text", "")
+            calls = []
+            if a.get("ref"):
+                # The extension's own form-fill tool (works for inputs/selects/checkboxes).
+                calls.append(("form_input", {"ref": a["ref"], "value": text}))
+            elif a.get("selector"):
+                sel = json.dumps(a["selector"])
+                val = json.dumps(text)
+                expr = (
+                    f"(function(){{var el=document.querySelector({sel});"
+                    f"if(!el)throw new Error('Element not found: '+{sel});el.focus();"
+                    f"if(el.isContentEditable){{document.execCommand('insertText',false,{val});}}"
+                    f"else if('value' in el){{var p=el instanceof HTMLTextAreaElement?"
+                    f"HTMLTextAreaElement.prototype:HTMLInputElement.prototype;"
+                    f"var s=Object.getOwnPropertyDescriptor(p,'value').set;"
+                    f"s.call(el,(el.value||'')+{val});"
+                    f"el.dispatchEvent(new Event('input',{{bubbles:true}}));"
+                    f"el.dispatchEvent(new Event('change',{{bubbles:true}}));}}"
+                    f"else{{throw new Error('Element <'+el.tagName.toLowerCase()+'> is not typeable');}}"
+                    f"return 'typed into <'+el.tagName.toLowerCase()+'>';}})()"
+                )
+                calls.append(self._js_call(expr))
+            else:
+                # Type into whatever element currently has focus.
+                calls.append(("computer", {"action": "type", "text": text}))
+            if a.get("pressEnter"):
+                calls.append(("computer", {"action": "key", "text": "Return"}))
+            return calls, None
+
+        # Unknown tool: pass through unchanged.
+        return [(mcp_name, a)], None
+
+    async def _run_call_chain(self, calls: list, _retried: bool = False) -> dict:
+        """Run a sequence of (internal_name, args) calls; return the last result.
+
+        Stops at the first error. If the extension reports the cached tab group
+        is stale, re-initializes it once and re-runs the whole chain.
+        """
+        result: dict = {"result": {"content": []}}
+        for internal_name, raw_args in calls:
+            args = self._inject_tab_id(internal_name, raw_args)
+            result = await self._send_and_wait(internal_name, args, timeout=60.0)
+            if self._is_stale_tab_error(result) and not _retried:
+                log.warning("Stale tab group on %s; re-initializing and retrying", internal_name)
+                self._reset_tab_group_state()
+                if await self._ensure_tab_group():
+                    return await self._run_call_chain(calls, _retried=True)
+            if "error" in result:
+                return result
+            self._update_active_tab_from_response(result)
+        return result
 
     @staticmethod
     def _is_stale_tab_error(result: dict) -> bool:
@@ -536,7 +683,7 @@ class MCPServer:
                 },
                 "serverInfo": {
                     "name": "chrome-browser-mcp",
-                    "version": "1.2.0",
+                    "version": "1.3.0",
                 },
             },
         }
@@ -556,108 +703,53 @@ class MCPServer:
         }
 
     async def _handle_tools_call(self, request: dict) -> dict:
-        """Handle MCP tools/call request by proxying to Chrome extension."""
+        """Handle MCP tools/call by translating it into Chrome-extension tool call(s)."""
         params = request.get("params", {})
         tool_name = params.get("name", "")
-        tool_args = params.get("arguments", {})
+        tool_args = params.get("arguments", {}) or {}
         request_id = request.get("id")
 
         log.info("Tool call: %s(%s)", tool_name, json.dumps(tool_args))
 
+        def reply(result: dict) -> dict:
+            return {"jsonrpc": "2.0", "id": request_id, "result": result}
+
         if not self.socket_connected:
-            return {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": "Error: Chrome extension is not connected. Make sure Chrome is running with the 'Claude in Chrome' extension and the chrome-native-host bridge is active.",
-                        }
-                    ],
-                    "isError": True,
-                },
-            }
+            return reply(self._error_result(
+                "Chrome extension is not connected. Make sure Chrome is running with the "
+                "'Claude in Chrome' extension and the chrome-native-host bridge is active."))
 
-        # Ensure tab group is initialized
+        # Translate the MCP call into one or more Chrome-extension tool calls.
+        calls, local_result = self._translate_call(tool_name, tool_args)
+        if local_result is not None:
+            return reply(local_result)
+        if not calls:
+            return reply(self._error_result(f"Unsupported tool: {tool_name}"))
+
+        # The extension requires an MCP tab group to exist before any call.
         if not await self._ensure_tab_group():
-            return {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": "Error: Could not initialize MCP tab group. Make sure Chrome has at least one tab open.",
-                        }
-                    ],
-                    "isError": True,
-                },
-            }
+            return reply(self._error_result(
+                "Could not initialize the MCP tab group. Make sure Chrome has at least one tab open."))
 
-        # Map MCP tool name to Chrome extension internal name
-        internal_name = TOOL_NAME_MAP.get(tool_name, tool_name)
-
-        # Send the tool call. If the extension reports the cached MCP tab group
-        # is gone (the user closed the tab, or Chrome suspended the extension
-        # service worker and it lost its in-memory state), re-initialize the
-        # tab group once and retry -- otherwise every later call keeps failing
-        # with "No tabs available" until the MCP server is restarted.
-        attempt_args = dict(tool_args)
-        self._inject_tab_args(internal_name, attempt_args)
-        result = await self._send_and_wait(internal_name, attempt_args, timeout=60.0)
-
-        if self._is_stale_tab_error(result):
-            log.warning("Stale tab group on %s; re-initializing and retrying", internal_name)
-            self._reset_tab_group_state()
-            if await self._ensure_tab_group():
-                attempt_args = dict(tool_args)
-                self._inject_tab_args(internal_name, attempt_args)
-                result = await self._send_and_wait(internal_name, attempt_args, timeout=60.0)
+        result = await self._run_call_chain(calls)
 
         if "error" in result:
-            error_content = result["error"]
-            if isinstance(error_content, dict):
-                error_content = error_content.get("content", error_content)
-            error_text = error_content if isinstance(error_content, str) else json.dumps(error_content, ensure_ascii=False)
-            return {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": f"Error: {error_text}",
-                        }
-                    ],
-                    "isError": True,
-                },
-            }
+            err = result["error"]
+            if isinstance(err, dict):
+                err = err.get("content", err)
+            err_text = err if isinstance(err, str) else json.dumps(err, ensure_ascii=False)
+            return reply(self._error_result(err_text))
 
-        # Update active tab from response
-        self._update_active_tab_from_response(result)
-
-        # Format the result for MCP
+        # Format the extension's result for the MCP client.
         tool_result = result.get("result", {})
-        if isinstance(tool_result, dict):
-            content = tool_result.get("content", tool_result)
-        else:
-            content = tool_result
-
+        content = tool_result.get("content", tool_result) if isinstance(tool_result, dict) else tool_result
         if isinstance(content, list):
             mcp_content = content
         elif isinstance(content, str):
             mcp_content = [{"type": "text", "text": content}]
         else:
             mcp_content = [{"type": "text", "text": json.dumps(content, indent=2, ensure_ascii=False)}]
-
-        return {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": {
-                "content": mcp_content,
-            },
-        }
+        return reply({"content": mcp_content})
 
     async def _handle_ping(self, request: dict) -> dict:
         """Handle MCP ping request."""
