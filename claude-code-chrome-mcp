@@ -49,6 +49,19 @@ SOCKET_DIR = os.environ.get(
 RECONNECT_INTERVAL = 2.0
 MAX_RECONNECT_INTERVAL = 30.0
 
+# Socket error texts that mean the cached MCP tab group / active tab is gone
+# (the user closed the tab, or Chrome suspended the extension service worker
+# and it lost its in-memory state). When seen we drop the cached tab state,
+# re-initialize the tab group via tabs_context_mcp(createIfEmpty=True) and
+# retry the call once.
+STALE_TAB_ERROR_MARKERS = (
+    "No tabs available",
+    "No tab with id",
+    "No such tab",
+    "Tab group not found",
+    "tabGroupId not found",
+)
+
 # MCP tool name -> Chrome extension internal tool name mapping.
 # The extension uses short names internally while the MCP interface
 # exposes "browser_*" names for Claude Code compatibility.
@@ -394,9 +407,7 @@ class MCPServer:
             return False
 
         # Reset stale state before re-initializing
-        self.active_tab_id = None
-        self.tab_group_id = None
-        self.tab_group_initialized = False
+        self._reset_tab_group_state()
 
         # Call tabs_context_mcp with createIfEmpty to initialize or retrieve
         result = await self._send_and_wait(
@@ -470,6 +481,31 @@ class MCPServer:
         except Exception:
             pass
 
+    def _reset_tab_group_state(self) -> None:
+        """Forget the cached MCP tab group so the next call re-initializes it."""
+        self.active_tab_id = None
+        self.tab_group_id = None
+        self.tab_group_initialized = False
+
+    def _inject_tab_args(self, internal_name: str, tool_args: dict) -> None:
+        """Auto-inject the active tabId / tabGroupId into a tool call's args."""
+        if "tabId" not in tool_args and self.active_tab_id is not None:
+            tool_args["tabId"] = self.active_tab_id
+        if internal_name in ("tabs_context_mcp", "tabs_create_mcp", "tabs_context"):
+            if "tabGroupId" not in tool_args and self.tab_group_id is not None:
+                tool_args["tabGroupId"] = self.tab_group_id
+
+    @staticmethod
+    def _is_stale_tab_error(result: dict) -> bool:
+        """True if the socket response means the cached tab/group no longer exists."""
+        err = result.get("error")
+        if not err:
+            return False
+        if isinstance(err, dict):
+            err = err.get("content", err)
+        text = err if isinstance(err, str) else json.dumps(err, ensure_ascii=False)
+        return any(marker in text for marker in STALE_TAB_ERROR_MARKERS)
+
     # -- Socket reconnection --------------------------------------------------
 
     async def _maintain_socket_connection(self) -> None:
@@ -478,9 +514,7 @@ class MCPServer:
         while self.running:
             if not self.socket_connected:
                 # Reset cached tab state so we re-initialize after reconnect
-                self.active_tab_id = None
-                self.tab_group_id = None
-                self.tab_group_initialized = False
+                self._reset_tab_group_state()
                 if await self._connect_socket():
                     interval = RECONNECT_INTERVAL
                     asyncio.get_running_loop().create_task(self._read_socket_loop())
@@ -502,7 +536,7 @@ class MCPServer:
                 },
                 "serverInfo": {
                     "name": "chrome-browser-mcp",
-                    "version": "1.1.0",
+                    "version": "1.2.0",
                 },
             },
         }
@@ -564,79 +598,28 @@ class MCPServer:
         # Map MCP tool name to Chrome extension internal name
         internal_name = TOOL_NAME_MAP.get(tool_name, tool_name)
 
-        # Auto-inject tabId if not present
-        if "tabId" not in tool_args and self.active_tab_id is not None:
-            tool_args["tabId"] = self.active_tab_id
+        # Send the tool call. If the extension reports the cached MCP tab group
+        # is gone (the user closed the tab, or Chrome suspended the extension
+        # service worker and it lost its in-memory state), re-initialize the
+        # tab group once and retry -- otherwise every later call keeps failing
+        # with "No tabs available" until the MCP server is restarted.
+        attempt_args = dict(tool_args)
+        self._inject_tab_args(internal_name, attempt_args)
+        result = await self._send_and_wait(internal_name, attempt_args, timeout=60.0)
 
-        # Auto-inject tabGroupId for tab group tools
-        if internal_name in ("tabs_context_mcp", "tabs_create_mcp", "tabs_context"):
-            if "tabGroupId" not in tool_args and self.tab_group_id is not None:
-                tool_args["tabGroupId"] = self.tab_group_id
+        if self._is_stale_tab_error(result):
+            log.warning("Stale tab group on %s; re-initializing and retrying", internal_name)
+            self._reset_tab_group_state()
+            if await self._ensure_tab_group():
+                attempt_args = dict(tool_args)
+                self._inject_tab_args(internal_name, attempt_args)
+                result = await self._send_and_wait(internal_name, attempt_args, timeout=60.0)
 
-        self.request_counter += 1
-        req_key = self.request_counter
-
-        future: asyncio.Future = asyncio.get_running_loop().create_future()
-        self.pending_requests[req_key] = future
-
-        socket_msg = {
-            "method": "execute_tool",
-            "params": {
-                "tool": internal_name,
-                "args": tool_args,
-            },
-        }
-        self._write_socket(socket_msg)
-
-        try:
-            result = await asyncio.wait_for(future, timeout=60.0)
-
-            if "error" in result:
-                error_content = result["error"]
-                if isinstance(error_content, dict):
-                    error_content = error_content.get("content", error_content)
-                error_text = error_content if isinstance(error_content, str) else json.dumps(error_content, ensure_ascii=False)
-                return {
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "result": {
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": f"Error: {error_text}",
-                            }
-                        ],
-                        "isError": True,
-                    },
-                }
-
-            # Update active tab from response
-            self._update_active_tab_from_response(result)
-
-            # Format the result for MCP
-            tool_result = result.get("result", {})
-            if isinstance(tool_result, dict):
-                content = tool_result.get("content", tool_result)
-            else:
-                content = tool_result
-
-            if isinstance(content, list):
-                mcp_content = content
-            elif isinstance(content, str):
-                mcp_content = [{"type": "text", "text": content}]
-            else:
-                mcp_content = [{"type": "text", "text": json.dumps(content, indent=2, ensure_ascii=False)}]
-
-            return {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {
-                    "content": mcp_content,
-                },
-            }
-
-        except asyncio.TimeoutError:
-            self.pending_requests.pop(req_key, None)
+        if "error" in result:
+            error_content = result["error"]
+            if isinstance(error_content, dict):
+                error_content = error_content.get("content", error_content)
+            error_text = error_content if isinstance(error_content, str) else json.dumps(error_content, ensure_ascii=False)
             return {
                 "jsonrpc": "2.0",
                 "id": request_id,
@@ -644,12 +627,37 @@ class MCPServer:
                     "content": [
                         {
                             "type": "text",
-                            "text": "Error: Timed out waiting for Chrome extension response (60s)",
+                            "text": f"Error: {error_text}",
                         }
                     ],
                     "isError": True,
                 },
             }
+
+        # Update active tab from response
+        self._update_active_tab_from_response(result)
+
+        # Format the result for MCP
+        tool_result = result.get("result", {})
+        if isinstance(tool_result, dict):
+            content = tool_result.get("content", tool_result)
+        else:
+            content = tool_result
+
+        if isinstance(content, list):
+            mcp_content = content
+        elif isinstance(content, str):
+            mcp_content = [{"type": "text", "text": content}]
+        else:
+            mcp_content = [{"type": "text", "text": json.dumps(content, indent=2, ensure_ascii=False)}]
+
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "content": mcp_content,
+            },
+        }
 
     async def _handle_ping(self, request: dict) -> dict:
         """Handle MCP ping request."""
