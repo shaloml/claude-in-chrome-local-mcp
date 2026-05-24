@@ -21,6 +21,7 @@ Chrome extension v1.0.49+ requires:
   3. Each tool call must include a tabId in args
 """
 
+import argparse
 import asyncio
 import json
 import logging
@@ -29,6 +30,7 @@ import re
 import signal
 import struct
 import sys
+import uuid
 
 LOG_DIR = os.path.expanduser("~/.config/Claude/logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -44,6 +46,9 @@ SOCKET_DIR = os.environ.get(
     "CHROME_MCP_SOCKET_DIR",
     f"/tmp/claude-mcp-browser-bridge-{USERNAME}",
 )
+# Honor an explicit socket override (full path or filename inside SOCKET_DIR).
+# CLI --socket overrides this at startup; browser_select_profile overrides at runtime.
+PREFERRED_SOCKET_ENV = os.environ.get("CHROME_MCP_SOCKET", "").strip() or None
 
 # Reconnect settings
 RECONNECT_INTERVAL = 2.0
@@ -82,7 +87,7 @@ BROWSER_TOOLS = [
     },
     {
         "name": "browser_click",
-        "description": "Click an element in the browser page. Provide a 'ref' from browser_snapshot, a CSS 'selector', or explicit 'x'/'y' pixel coordinates.",
+        "description": "Click an element in the browser page. Provide a 'ref' from browser_snapshot, a CSS 'selector', or explicit 'x'/'y' pixel coordinates. Supports right/double/triple-click and modifier keys.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -96,7 +101,70 @@ BROWSER_TOOLS = [
                 },
                 "x": {"type": "number", "description": "X pixel coordinate to click (use together with 'y')"},
                 "y": {"type": "number", "description": "Y pixel coordinate to click (use together with 'x')"},
+                "button": {
+                    "type": "string",
+                    "enum": ["left", "right"],
+                    "description": "Mouse button (default: left). 'right' opens the context menu.",
+                },
+                "clicks": {
+                    "type": "number",
+                    "enum": [1, 2, 3],
+                    "description": "1 = single click (default), 2 = double-click, 3 = triple-click (selects text). Ignored when button=right.",
+                },
+                "modifiers": {
+                    "type": "string",
+                    "description": "Modifier keys held during the click, '+'-separated. Examples: 'ctrl', 'shift', 'cmd+shift'. Supports: ctrl, shift, alt, cmd/meta, win/windows.",
+                },
             },
+        },
+    },
+    {
+        "name": "browser_hover",
+        "description": "Move the mouse over an element without clicking. Reveals tooltips, dropdown menus, and other hover-triggered UI.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string", "description": "Reference ID of the element to hover over (from a browser_snapshot)"},
+                "x": {"type": "number", "description": "X pixel coordinate to hover (use together with 'y')"},
+                "y": {"type": "number", "description": "Y pixel coordinate to hover (use together with 'x')"},
+            },
+        },
+    },
+    {
+        "name": "browser_drag",
+        "description": "Drag from one point to another (left-button down, move, up). Useful for sliders, drag-and-drop, and selection.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "from_x": {"type": "number", "description": "Starting X coordinate"},
+                "from_y": {"type": "number", "description": "Starting Y coordinate"},
+                "to_x": {"type": "number", "description": "Ending X coordinate"},
+                "to_y": {"type": "number", "description": "Ending Y coordinate"},
+            },
+            "required": ["from_x", "from_y", "to_x", "to_y"],
+        },
+    },
+    {
+        "name": "browser_press_key",
+        "description": "Press a key or keyboard shortcut. Provide space-separated keys (e.g. 'Backspace Backspace Delete') or '+'-joined chords (e.g. 'ctrl+a', 'cmd+shift+t'). Use 'ctrl' on Linux/Windows, 'cmd' on Mac.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Key(s) to press. Examples: 'Return', 'Escape', 'ctrl+a', 'Tab Tab Tab'."},
+                "repeat": {"type": "number", "description": "Repeat the key sequence this many times (1-100, default 1)"},
+            },
+            "required": ["text"],
+        },
+    },
+    {
+        "name": "browser_wait",
+        "description": "Pause for a number of seconds (typically for the page to settle, an animation to play, or a network request to finish).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "seconds": {"type": "number", "description": "Number of seconds to wait"},
+            },
+            "required": ["seconds"],
         },
     },
     {
@@ -250,21 +318,161 @@ BROWSER_TOOLS = [
             "required": ["code"],
         },
     },
+    {
+        "name": "browser_resize_window",
+        "description": "Resize the Chrome window containing the active tab. Useful for testing responsive layouts and matching mobile/tablet viewport sizes.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "width": {"type": "number", "description": "Target window width in pixels (max 7680)"},
+                "height": {"type": "number", "description": "Target window height in pixels (max 4320)"},
+            },
+            "required": ["width", "height"],
+        },
+    },
+    {
+        "name": "browser_get_page_text",
+        "description": "Extract plain text from the active tab, prioritizing the main article/content area. Ideal for reading articles or text-heavy pages. Returns up to 50000 characters by default.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "max_chars": {"type": "number", "description": "Maximum characters to return (default 50000)"},
+            },
+        },
+    },
+    {
+        "name": "browser_network_requests",
+        "description": "List HTTP requests (XHR/fetch/document/image/etc.) observed in the active tab. Useful for debugging API calls. Requests are cleared on cross-domain navigation.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "urlPattern": {"type": "string", "description": "Substring filter for the request URL (e.g. '/api/' or 'example.com')"},
+                "clear": {"type": "boolean", "description": "Clear the captured requests after reading (default: false)"},
+                "limit": {"type": "number", "description": "Maximum number of requests to return (default: 100)"},
+            },
+        },
+    },
+    {
+        "name": "browser_form_input",
+        "description": "Set the value of a form element (input, textarea, select, checkbox) by reference ID. Use browser_snapshot first to get the ref. For checkboxes pass a boolean; for selects pass the option value or visible text.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string", "description": "Element reference ID from a browser_snapshot"},
+                "value": {
+                    "type": ["string", "boolean", "number"],
+                    "description": "Value to set",
+                },
+            },
+            "required": ["ref", "value"],
+        },
+    },
+    {
+        "name": "browser_upload_image",
+        "description": "Upload a previously captured screenshot (by imageId) to a file input or drag-and-drop target on the page.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "imageId": {"type": "string", "description": "ID of a previously captured screenshot (returned by browser_screen_capture)"},
+                "ref": {"type": "string", "description": "Reference ID of the file input or drop target (from browser_snapshot)"},
+                "x": {"type": "number", "description": "X coordinate for drag-and-drop targets (alternative to ref)"},
+                "y": {"type": "number", "description": "Y coordinate for drag-and-drop targets (alternative to ref)"},
+                "filename": {"type": "string", "description": "Filename to present to the page (default 'image.png')"},
+            },
+            "required": ["imageId"],
+        },
+    },
+    {
+        "name": "browser_file_upload",
+        "description": "Upload one or more files (provided inline as base64) to a file input element. Do NOT click file inputs directly — they open a native picker the agent cannot interact with. Locate the input with browser_snapshot, then call this with the ref.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string", "description": "Reference ID of the file input (from browser_snapshot)"},
+                "files": {
+                    "type": "array",
+                    "description": "Files to upload",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "data": {"type": "string", "description": "Base64-encoded file contents"},
+                            "name": {"type": "string", "description": "Filename presented to the page"},
+                            "mimeType": {"type": "string", "description": "MIME type (e.g. 'image/png')"},
+                        },
+                        "required": ["data", "name"],
+                    },
+                },
+            },
+            "required": ["ref", "files"],
+        },
+    },
+    {
+        "name": "browser_zoom",
+        "description": "Capture a screenshot of a specific rectangular region of the viewport and scale it up to fill the screen. Use this when you need to read fine detail or small UI elements.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "x0": {"type": "number", "description": "Top-left X of the region"},
+                "y0": {"type": "number", "description": "Top-left Y of the region"},
+                "x1": {"type": "number", "description": "Bottom-right X of the region"},
+                "y1": {"type": "number", "description": "Bottom-right Y of the region"},
+            },
+            "required": ["x0", "y0", "x1", "y1"],
+        },
+    },
+    {
+        "name": "browser_scroll_to",
+        "description": "Scroll an element into view by its reference ID.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string", "description": "Reference ID of the element to scroll into view (from browser_snapshot)"},
+            },
+            "required": ["ref"],
+        },
+    },
+    {
+        "name": "browser_list_profiles",
+        "description": "List the Chrome profile sockets currently available. The 'active' field marks the socket this MCP server is currently connected to. Use browser_select_profile to switch.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "browser_select_profile",
+        "description": "Switch the MCP bridge to a different Chrome profile's socket. Pass either the full socket path or its filename (e.g. '12345.sock'). Use browser_list_profiles to see candidates.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "socket": {"type": "string", "description": "Socket path or filename to connect to"},
+            },
+            "required": ["socket"],
+        },
+    },
 ]
 
 
 class MCPServer:
     """MCP server that proxies tool calls to the Chrome extension via Unix socket."""
 
-    def __init__(self):
+    def __init__(self, preferred_socket: str | None = None):
         self.running = True
         self.socket_reader: asyncio.StreamReader | None = None
         self.socket_writer: asyncio.StreamWriter | None = None
         self.socket_connected = False
+        self.current_socket_path: str | None = None
+        self.preferred_socket: str | None = preferred_socket or PREFERRED_SOCKET_ENV
         self.pending_requests: dict[str | int, asyncio.Future] = {}
         self.request_counter = 0
         self.socket_buf = b""
         self.stdin_buf = b""
+        # Per-MCP-run session id. Passed as session_scope so the extension uses
+        # session-scoped tab groups (auto-cleanable) instead of the legacy shared one.
+        self.session_id = uuid.uuid4().hex
+        # When multiple sockets are visible and no preferred socket is set, we
+        # refuse to silently auto-pick one. The first tool call returns an error
+        # asking the caller to use browser_list_profiles / browser_select_profile.
+        # Cleared once the user picks (via browser_select_profile) or when only
+        # one socket is available.
+        self.needs_profile_choice = False
         # Active tab tracking for auto-injection
         self.active_tab_id: int | None = None
         self.tab_group_id: int | None = None
@@ -286,36 +494,114 @@ class MCPServer:
         if not os.path.isdir(SOCKET_DIR):
             return paths
         try:
-            for name in os.listdir(SOCKET_DIR):
+            for name in sorted(os.listdir(SOCKET_DIR)):
                 if name.endswith(".sock"):
                     paths.append(os.path.join(SOCKET_DIR, name))
         except OSError:
             pass
         return paths
 
+    def _resolve_preferred_socket(self) -> str | None:
+        """Turn a partial preferred-socket spec (path or filename) into an absolute path."""
+        s = self.preferred_socket
+        if not s:
+            return None
+        if os.path.isabs(s):
+            return s
+        return os.path.join(SOCKET_DIR, s)
+
     async def _connect_socket(self) -> bool:
         """Connect to the chrome-native-host Unix socket.
 
-        Tries all .sock files in the socket directory until one succeeds.
+        If a preferred socket is configured, try it exclusively. Otherwise fall back to
+        the first .sock that accepts a connection — but if more than one socket is
+        present we flag `needs_profile_choice` so the next tool call forces the caller
+        to pick one explicitly via browser_select_profile.
         """
-        socket_paths = self._find_socket_paths()
-        if not socket_paths:
+        preferred = self._resolve_preferred_socket()
+        all_paths = self._find_socket_paths()
+        if preferred:
+            candidates = [preferred]
+            self.needs_profile_choice = False
+        else:
+            candidates = all_paths
+            self.needs_profile_choice = len(all_paths) > 1
+        if not candidates:
             log.warning("No sockets found in %s", SOCKET_DIR)
             return False
-        for path in socket_paths:
+        for path in candidates:
             try:
                 self.socket_reader, self.socket_writer = (
                     await asyncio.open_unix_connection(path)
                 )
                 self.socket_connected = True
+                self.current_socket_path = path
                 log.info("Connected to chrome-native-host socket at %s", path)
                 return True
             except Exception as exc:
                 log.debug("Failed to connect to socket %s: %s", path, exc)
                 continue
-        log.warning("Could not connect to any socket in %s", SOCKET_DIR)
+        if preferred:
+            log.warning("Preferred socket %s could not be reached", preferred)
+        else:
+            log.warning("Could not connect to any socket in %s", SOCKET_DIR)
         self.socket_connected = False
         return False
+
+    def _list_profiles_result(self) -> dict:
+        """Return an MCP text result describing the candidate sockets."""
+        paths = self._find_socket_paths()
+        if not paths:
+            return self._text_result(
+                f"No Chrome profiles connected. Socket directory {SOCKET_DIR} has no .sock files. "
+                f"Make sure Chrome is running with the 'Claude in Chrome' extension installed."
+            )
+        lines = [f"Socket directory: {SOCKET_DIR}"]
+        for p in paths:
+            marker = "  * " if p == self.current_socket_path else "    "
+            lines.append(f"{marker}{os.path.basename(p)}  ({p})")
+        lines.append("")
+        lines.append("'*' marks the currently active socket. Use browser_select_profile to switch.")
+        return self._text_result("\n".join(lines))
+
+    async def _switch_socket(self, target: str) -> dict:
+        """Disconnect from the current socket and reconnect to `target`.
+
+        `target` may be a full path or just a filename inside SOCKET_DIR.
+        Returns an MCP result dict describing the outcome.
+        """
+        resolved = target if os.path.isabs(target) else os.path.join(SOCKET_DIR, target)
+        if not os.path.exists(resolved):
+            return self._error_result(f"Socket not found: {resolved}")
+
+        # Close the existing socket, drop tab-group cache, set preference, reconnect.
+        await self._close_socket()
+        self.preferred_socket = resolved
+        self._reset_tab_group_state()
+        if not await self._connect_socket():
+            return self._error_result(f"Could not connect to {resolved}")
+        # Explicit choice made — don't block subsequent calls.
+        self.needs_profile_choice = False
+        asyncio.get_running_loop().create_task(self._read_socket_loop())
+        return self._text_result(f"Connected to {resolved}")
+
+    async def _close_socket(self) -> None:
+        """Cleanly close the current socket connection if any."""
+        writer = self.socket_writer
+        self.socket_connected = False
+        self.socket_reader = None
+        self.socket_writer = None
+        # Cancel pending requests so callers don't hang.
+        for fut in list(self.pending_requests.values()):
+            if not fut.done():
+                fut.cancel()
+        self.pending_requests.clear()
+        if writer is not None:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     def _write_socket(self, msg: dict) -> None:
         """Send a message to chrome-native-host via the Unix socket."""
@@ -338,10 +624,17 @@ class MCPServer:
         future: asyncio.Future = asyncio.get_running_loop().create_future()
         self.pending_requests[req_key] = future
 
-        self._write_socket({
-            "method": "execute_tool",
-            "params": {"tool": tool, "args": args},
-        })
+        # `session_scope` tells the extension to use a session-scoped tab group
+        # (auto-cleaned) instead of the legacy shared one.
+        params: dict = {
+            "tool": tool,
+            "args": args,
+            "session_scope": {"sessionId": self.session_id},
+        }
+        if self.tab_group_id is not None and "tabGroupId" not in args:
+            args["tabGroupId"] = self.tab_group_id
+
+        self._write_socket({"method": "execute_tool", "params": params})
 
         try:
             return await asyncio.wait_for(future, timeout=timeout)
@@ -435,10 +728,10 @@ class MCPServer:
                             for tab in tabs:
                                 url = tab.get("url", "")
                                 if not url.startswith("chrome://"):
-                                    self.active_tab_id = tab["tabId"]
+                                    self.active_tab_id = self._extract_tab_id(tab)
                                     break
                             if self.active_tab_id is None:
-                                self.active_tab_id = tabs[0]["tabId"]
+                                self.active_tab_id = self._extract_tab_id(tabs[0])
                         if "tabGroupId" in data:
                             self.tab_group_id = data["tabGroupId"]
                         self.tab_group_initialized = True
@@ -451,6 +744,11 @@ class MCPServer:
                         continue
         except Exception:
             log.exception("Failed to parse tab context")
+
+    @staticmethod
+    def _extract_tab_id(tab: dict):
+        """tabs_context_mcp returns 'id', other responses use 'tabId' — accept both."""
+        return tab.get("tabId", tab.get("id"))
 
     def _update_active_tab_from_response(self, result: dict) -> None:
         """Update active_tab_id from tool response Tab Context info."""
@@ -578,12 +876,32 @@ class MCPServer:
             return [self._js_call(expr)], None
 
         if mcp_name == "browser_click":
+            button = a.get("button", "left")
+            clicks = int(a.get("clicks", 1) or 1)
+            modifiers = a.get("modifiers")
+            if button == "right":
+                action = "right_click"
+            elif clicks == 3:
+                action = "triple_click"
+            elif clicks == 2:
+                action = "double_click"
+            else:
+                action = "left_click"
+            ia: dict = {"action": action}
+            if modifiers:
+                ia["modifiers"] = modifiers
             if a.get("ref"):
-                return [("computer", {"action": "left_click", "ref": a["ref"]})], None
+                ia["ref"] = a["ref"]
+                return [("computer", ia)], None
             if a.get("x") is not None and a.get("y") is not None:
-                return [("computer", {"action": "left_click",
-                                      "coordinate": [a["x"], a["y"]]})], None
+                ia["coordinate"] = [a["x"], a["y"]]
+                return [("computer", ia)], None
             if a.get("selector"):
+                # No native selector path; fall back to JS click. Only honors single left-click.
+                if action != "left_click" or modifiers:
+                    return [], self._error_result(
+                        "browser_click: 'selector' only supports single left-click without modifiers; use 'ref' or 'x'/'y' instead"
+                    )
                 sel = json.dumps(a["selector"])
                 expr = (f"(function(){{var el=document.querySelector({sel});"
                         f"if(!el)throw new Error('Element not found: '+{sel});"
@@ -591,6 +909,107 @@ class MCPServer:
                         f"return 'clicked '+el.tagName.toLowerCase();}})()")
                 return [self._js_call(expr)], None
             return [], self._error_result("browser_click requires 'ref', 'selector', or 'x'+'y'")
+
+        if mcp_name == "browser_hover":
+            ia = {"action": "hover"}
+            if a.get("ref"):
+                ia["ref"] = a["ref"]
+            elif a.get("x") is not None and a.get("y") is not None:
+                ia["coordinate"] = [a["x"], a["y"]]
+            else:
+                return [], self._error_result("browser_hover requires 'ref' or 'x'+'y'")
+            return [("computer", ia)], None
+
+        if mcp_name == "browser_drag":
+            for k in ("from_x", "from_y", "to_x", "to_y"):
+                if a.get(k) is None:
+                    return [], self._error_result(f"browser_drag requires '{k}'")
+            return [("computer", {
+                "action": "left_click_drag",
+                "start_coordinate": [a["from_x"], a["from_y"]],
+                "coordinate": [a["to_x"], a["to_y"]],
+            })], None
+
+        if mcp_name == "browser_press_key":
+            text = a.get("text")
+            if not text:
+                return [], self._error_result("browser_press_key requires 'text'")
+            ia = {"action": "key", "text": text}
+            if a.get("repeat"):
+                ia["repeat"] = int(a["repeat"])
+            return [("computer", ia)], None
+
+        if mcp_name == "browser_wait":
+            sec = a.get("seconds")
+            if sec is None:
+                return [], self._error_result("browser_wait requires 'seconds'")
+            return [("computer", {"action": "wait", "duration": float(sec)})], None
+
+        if mcp_name == "browser_zoom":
+            for k in ("x0", "y0", "x1", "y1"):
+                if a.get(k) is None:
+                    return [], self._error_result(f"browser_zoom requires '{k}'")
+            return [("computer", {
+                "action": "zoom",
+                "region": [a["x0"], a["y0"], a["x1"], a["y1"]],
+            })], None
+
+        if mcp_name == "browser_scroll_to":
+            if not a.get("ref"):
+                return [], self._error_result("browser_scroll_to requires 'ref'")
+            return [("computer", {"action": "scroll_to", "ref": a["ref"]})], None
+
+        if mcp_name == "browser_resize_window":
+            w, h = a.get("width"), a.get("height")
+            if not w or not h:
+                return [], self._error_result("browser_resize_window requires 'width' and 'height'")
+            return [("resize_window", {"width": int(w), "height": int(h)})], None
+
+        if mcp_name == "browser_get_page_text":
+            ia = {}
+            if a.get("max_chars"):
+                ia["max_chars"] = int(a["max_chars"])
+            return [("get_page_text", ia)], None
+
+        if mcp_name == "browser_network_requests":
+            ia = {}
+            if a.get("urlPattern"):
+                ia["urlPattern"] = a["urlPattern"]
+            if a.get("clear"):
+                ia["clear"] = True
+            if a.get("limit"):
+                ia["limit"] = int(a["limit"])
+            return [("read_network_requests", ia)], None
+
+        if mcp_name == "browser_form_input":
+            if not a.get("ref") or a.get("value") is None:
+                return [], self._error_result("browser_form_input requires 'ref' and 'value'")
+            return [("form_input", {"ref": a["ref"], "value": a["value"]})], None
+
+        if mcp_name == "browser_upload_image":
+            if not a.get("imageId"):
+                return [], self._error_result("browser_upload_image requires 'imageId'")
+            ia = {"imageId": a["imageId"]}
+            if a.get("ref"):
+                ia["ref"] = a["ref"]
+            elif a.get("x") is not None and a.get("y") is not None:
+                ia["coordinate"] = [a["x"], a["y"]]
+            else:
+                return [], self._error_result("browser_upload_image requires 'ref' or 'x'+'y'")
+            if a.get("filename"):
+                ia["filename"] = a["filename"]
+            return [("upload_image", ia)], None
+
+        if mcp_name == "browser_file_upload":
+            if not a.get("ref") or not isinstance(a.get("files"), list):
+                return [], self._error_result("browser_file_upload requires 'ref' and 'files' (list)")
+            return [("file_upload", {"ref": a["ref"], "files": a["files"]})], None
+
+        if mcp_name == "browser_list_profiles":
+            return [], self._list_profiles_result()
+
+        # browser_select_profile is handled directly in _handle_tools_call (needs await).
+        # Falling through here would treat it as unknown.
 
         if mcp_name == "browser_type":
             text = a.get("text", "")
@@ -717,10 +1136,38 @@ class MCPServer:
         def reply(result: dict) -> dict:
             return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
+        # Profile-switching needs an await before/after the socket reconnect,
+        # so it's handled inline rather than via _translate_call.
+        if tool_name == "browser_select_profile":
+            target = tool_args.get("socket")
+            if not target:
+                return reply(self._error_result("browser_select_profile requires 'socket'"))
+            return reply(await self._switch_socket(target))
+
+        # Always let the caller inspect available profiles, even before a choice
+        # is made.
+        if tool_name == "browser_list_profiles":
+            return reply(self._list_profiles_result())
+
         if not self.socket_connected:
             return reply(self._error_result(
                 "Chrome extension is not connected. Make sure Chrome is running with the "
                 "'Claude in Chrome' extension and the chrome-native-host bridge is active."))
+
+        # Multiple Chrome profiles are running and no preference was set —
+        # require the caller to pick one before doing anything that touches a tab.
+        if self.needs_profile_choice:
+            paths = self._find_socket_paths()
+            listing = "\n".join(
+                f"  - {os.path.basename(p)}" for p in paths
+            )
+            return reply(self._error_result(
+                "Multiple Chrome profiles are connected and no preference is set. "
+                "ASK THE USER which profile to use, then call browser_select_profile "
+                "with the socket name. Available sockets:\n"
+                f"{listing}\n"
+                "(You can also see this list anytime via browser_list_profiles.)"
+            ))
 
         # Translate the MCP call into one or more Chrome-extension tool calls.
         calls, local_result = self._translate_call(tool_name, tool_args)
@@ -857,7 +1304,16 @@ class MCPServer:
 
     async def run(self) -> None:
         """Main entry point."""
-        log.info("Claude Code Chrome MCP server starting")
+        log.info("Claude Code Chrome MCP server starting (session %s)", self.session_id[:8])
+
+        # Log discovered sockets up front so the user knows what's available.
+        paths = self._find_socket_paths()
+        if paths:
+            log.info("Available Chrome sockets in %s:", SOCKET_DIR)
+            for p in paths:
+                log.info("  %s", p)
+        if self.preferred_socket:
+            log.info("Preferred socket: %s", self._resolve_preferred_socket())
 
         # Start background socket connection maintainer
         socket_task = asyncio.create_task(self._maintain_socket_connection())
@@ -872,17 +1328,40 @@ class MCPServer:
                 await socket_task
             except asyncio.CancelledError:
                 pass
-            if self.socket_writer:
-                try:
-                    self.socket_writer.close()
-                    await self.socket_writer.wait_closed()
-                except Exception:
-                    pass
+            await self._close_socket()
             log.info("Claude Code Chrome MCP server stopped")
 
 
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="claude-code-chrome-mcp",
+        description="MCP bridge to the 'Claude in Chrome' extension over a Unix socket.",
+    )
+    p.add_argument("--socket", metavar="PATH",
+                   help="Connect to this socket only (full path or filename inside the socket dir). "
+                        "Defaults to env CHROME_MCP_SOCKET, otherwise tries each .sock in the directory.")
+    p.add_argument("--list-sockets", action="store_true",
+                   help="List the candidate sockets and exit (does not start the server).")
+    return p.parse_args(argv)
+
+
 def main() -> None:
-    server = MCPServer()
+    args = _parse_args(sys.argv[1:])
+
+    if args.list_sockets:
+        if not os.path.isdir(SOCKET_DIR):
+            print(f"Socket directory does not exist: {SOCKET_DIR}", file=sys.stderr)
+            sys.exit(1)
+        names = sorted(n for n in os.listdir(SOCKET_DIR) if n.endswith(".sock"))
+        if not names:
+            print(f"No sockets in {SOCKET_DIR}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Socket directory: {SOCKET_DIR}")
+        for n in names:
+            print(f"  {n}")
+        return
+
+    server = MCPServer(preferred_socket=args.socket)
 
     def sig_handler(_sig, _frame):
         server._shutdown()
