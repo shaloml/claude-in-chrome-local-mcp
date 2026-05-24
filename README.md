@@ -87,6 +87,8 @@ CHROME_MCP_SOCKET=/tmp/.../472278.sock ./claude-code-chrome-mcp  # env-var form
 
 While the MCP is running you can also call `browser_list_profiles` to see the candidates and `browser_select_profile` to switch — no restart needed.
 
+When more than one `.sock` is present and no preference is set on startup, the first tool call returns an error telling the LLM to inspect the candidates via `browser_list_profiles` and ask the user which one to use before calling `browser_select_profile`. The server never auto-picks a profile in that situation.
+
 ## Extension limits
 
 The official extension does not expose a User-Agent override tool, so this MCP does not either — "Claude in Chrome" itself cannot spoof UA. For responsive-layout checks use `browser_resize_window` to shrink the Chrome window to a phone-sized viewport.

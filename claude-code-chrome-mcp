@@ -467,6 +467,12 @@ class MCPServer:
         # Per-MCP-run session id. Passed as session_scope so the extension uses
         # session-scoped tab groups (auto-cleanable) instead of the legacy shared one.
         self.session_id = uuid.uuid4().hex
+        # When multiple sockets are visible and no preferred socket is set, we
+        # refuse to silently auto-pick one. The first tool call returns an error
+        # asking the caller to use browser_list_profiles / browser_select_profile.
+        # Cleared once the user picks (via browser_select_profile) or when only
+        # one socket is available.
+        self.needs_profile_choice = False
         # Active tab tracking for auto-injection
         self.active_tab_id: int | None = None
         self.tab_group_id: int | None = None
@@ -508,13 +514,18 @@ class MCPServer:
         """Connect to the chrome-native-host Unix socket.
 
         If a preferred socket is configured, try it exclusively. Otherwise fall back to
-        the first .sock that accepts a connection.
+        the first .sock that accepts a connection — but if more than one socket is
+        present we flag `needs_profile_choice` so the next tool call forces the caller
+        to pick one explicitly via browser_select_profile.
         """
         preferred = self._resolve_preferred_socket()
+        all_paths = self._find_socket_paths()
         if preferred:
             candidates = [preferred]
+            self.needs_profile_choice = False
         else:
-            candidates = self._find_socket_paths()
+            candidates = all_paths
+            self.needs_profile_choice = len(all_paths) > 1
         if not candidates:
             log.warning("No sockets found in %s", SOCKET_DIR)
             return False
@@ -569,6 +580,8 @@ class MCPServer:
         self._reset_tab_group_state()
         if not await self._connect_socket():
             return self._error_result(f"Could not connect to {resolved}")
+        # Explicit choice made — don't block subsequent calls.
+        self.needs_profile_choice = False
         asyncio.get_running_loop().create_task(self._read_socket_loop())
         return self._text_result(f"Connected to {resolved}")
 
@@ -1131,10 +1144,30 @@ class MCPServer:
                 return reply(self._error_result("browser_select_profile requires 'socket'"))
             return reply(await self._switch_socket(target))
 
+        # Always let the caller inspect available profiles, even before a choice
+        # is made.
+        if tool_name == "browser_list_profiles":
+            return reply(self._list_profiles_result())
+
         if not self.socket_connected:
             return reply(self._error_result(
                 "Chrome extension is not connected. Make sure Chrome is running with the "
                 "'Claude in Chrome' extension and the chrome-native-host bridge is active."))
+
+        # Multiple Chrome profiles are running and no preference was set —
+        # require the caller to pick one before doing anything that touches a tab.
+        if self.needs_profile_choice:
+            paths = self._find_socket_paths()
+            listing = "\n".join(
+                f"  - {os.path.basename(p)}" for p in paths
+            )
+            return reply(self._error_result(
+                "Multiple Chrome profiles are connected and no preference is set. "
+                "ASK THE USER which profile to use, then call browser_select_profile "
+                "with the socket name. Available sockets:\n"
+                f"{listing}\n"
+                "(You can also see this list anytime via browser_list_profiles.)"
+            ))
 
         # Translate the MCP call into one or more Chrome-extension tool calls.
         calls, local_result = self._translate_call(tool_name, tool_args)
