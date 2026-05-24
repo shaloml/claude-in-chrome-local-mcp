@@ -744,7 +744,22 @@ class MCPServer:
         tool_result = result.get("result", {})
         content = tool_result.get("content", tool_result) if isinstance(tool_result, dict) else tool_result
         if isinstance(content, list):
-            mcp_content = content
+            # The extension returns images in Anthropic message shape
+            # ({"type":"image","source":{"type":"base64","media_type":"...","data":"..."}}),
+            # but MCP wants flat {"type":"image","data":"...","mimeType":"..."}.
+            mcp_content = []
+            for item in content:
+                if (isinstance(item, dict)
+                        and item.get("type") == "image"
+                        and isinstance(item.get("source"), dict)):
+                    source = item["source"]
+                    mcp_content.append({
+                        "type": "image",
+                        "data": source.get("data", ""),
+                        "mimeType": source.get("media_type", "image/png"),
+                    })
+                else:
+                    mcp_content.append(item)
         elif isinstance(content, str):
             mcp_content = [{"type": "text", "text": content}]
         else:
