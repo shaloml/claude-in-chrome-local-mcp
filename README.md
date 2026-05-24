@@ -12,6 +12,9 @@ Supports multiple simultaneous client connections and works with any MCP client.
 - **Simultaneous connections** — a single native host serves multiple clients
 - **Works with any MCP client** — not limited to Claude Desktop / Code
 - **Claude Desktop + Code coexistence** — avoids native host conflict ([#20887](https://github.com/anthropics/claude-code/issues/20887))
+- **Full extension toolset exposed** — clicks (right/double/triple + modifier keys), hover, drag, key press, wait, window resize, page-text extraction, network log, form input, file/image upload, zoom, and more
+- **Official-style session management** — sends `session_scope` on every request so the extension manages tab groups per-session, the same way the official "Claude in Chrome" does. The MCP does NOT auto-close any of your tabs on shutdown
+- **Pick which Chrome profile to connect to** — at startup via `--socket` / `CHROME_MCP_SOCKET`, or at runtime with the `browser_list_profiles` / `browser_select_profile` tools
 
 ## Architecture
 
@@ -69,6 +72,24 @@ No official Linux build of Claude Desktop is available. Use [claude-desktop-debi
 ```bash
 ./uninstall.sh
 ```
+
+---
+
+## Choosing a Chrome profile / instance
+
+When multiple Chrome processes (profiles or windows) run the extension simultaneously, you'll see several `.sock` files in `/tmp/claude-mcp-browser-bridge-$USER/`.
+
+```bash
+./claude-code-chrome-mcp --list-sockets        # list candidates
+./claude-code-chrome-mcp --socket 472278.sock  # pin to this socket only
+CHROME_MCP_SOCKET=/tmp/.../472278.sock ./claude-code-chrome-mcp  # env-var form
+```
+
+While the MCP is running you can also call `browser_list_profiles` to see the candidates and `browser_select_profile` to switch — no restart needed.
+
+## Extension limits
+
+The official extension does not expose a User-Agent override tool, so this MCP does not either — "Claude in Chrome" itself cannot spoof UA. For responsive-layout checks use `browser_resize_window` to shrink the Chrome window to a phone-sized viewport.
 
 ---
 
