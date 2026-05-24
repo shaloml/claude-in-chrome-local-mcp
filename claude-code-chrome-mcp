@@ -127,7 +127,13 @@ BROWSER_TOOLS = [
         "description": "Take an accessibility snapshot of the current page, returning a structured representation of the page content",
         "inputSchema": {
             "type": "object",
-            "properties": {},
+            "properties": {
+                "filter": {
+                    "type": "string",
+                    "enum": ["interactive", "all"],
+                    "description": "Restrict the snapshot to interactive elements only, or include everything (default: extension's own default)",
+                },
+            },
         },
     },
     {
@@ -167,13 +173,13 @@ BROWSER_TOOLS = [
     },
     {
         "name": "browser_tab_switch",
-        "description": "Switch to a specific browser tab",
+        "description": "Direct subsequent browser_* tool calls at the given tabId (updates the bridge's active-tab pointer; does not activate the tab in Chrome's UI)",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "tabId": {
                     "type": "number",
-                    "description": "The ID of the tab to switch to",
+                    "description": "The ID of the tab to target",
                 }
             },
             "required": ["tabId"],
@@ -562,16 +568,13 @@ class MCPServer:
 
         if mcp_name == "browser_scroll":
             # `computer` scroll needs pixel coordinates; doing it in-page is simpler.
+            # Schema only exposes vertical scrolling ("up" / "down").
             direction = a.get("direction", "down")
             amount = a.get("amount")
-            axis = "1" if direction in ("up", "down") else "0"
-            default = "window.innerHeight" if direction in ("up", "down") else "window.innerWidth"
-            magnitude = str(int(amount)) if amount else default
-            sign = "-" if direction in ("up", "left") else ""
-            dx, dy = (f"{sign}{magnitude}", "0") if axis == "0" else ("0", f"{sign}{magnitude}")
-            expr = (f"(function(){{window.scrollBy({dx}, {dy});"
-                    f"return 'scrolled {direction} (now at x='+Math.round(window.scrollX)"
-                    f"+', y='+Math.round(window.scrollY)+')';}})()")
+            magnitude = str(int(amount)) if amount else "window.innerHeight"
+            sign = "-" if direction == "up" else ""
+            expr = (f"(function(){{window.scrollBy(0, {sign}{magnitude});"
+                    f"return 'scrolled {direction} (now at y='+Math.round(window.scrollY)+')';}})()")
             return [self._js_call(expr)], None
 
         if mcp_name == "browser_click":
