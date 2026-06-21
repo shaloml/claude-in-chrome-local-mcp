@@ -499,6 +499,30 @@ class MCPServer:
         return {"content": [{"type": "text", "text": f"Error: {text}"}], "isError": True}
 
     @staticmethod
+    def _normalize_content(content: list) -> list:
+        """Convert the extension's content blocks into MCP-compliant ones.
+
+        The extension returns image blocks in Anthropic Messages-API shape
+        ({"type":"image","source":{"type":"base64","media_type":..,"data":..}}),
+        but the MCP tools/call result schema requires
+        {"type":"image","data":..,"mimeType":..}. Without this conversion Claude
+        Code rejects every screenshot result with a validation error.
+        """
+        out = []
+        for item in content:
+            if (isinstance(item, dict) and item.get("type") == "image"
+                    and "data" not in item and isinstance(item.get("source"), dict)):
+                src = item["source"]
+                out.append({
+                    "type": "image",
+                    "data": src.get("data", ""),
+                    "mimeType": src.get("media_type") or src.get("mimeType") or "image/png",
+                })
+            else:
+                out.append(item)
+        return out
+
+    @staticmethod
     def _js_call(expr: str) -> tuple:
         """A javascript_tool call that evaluates a single JS expression."""
         return ("javascript_tool", {"action": "javascript_exec", "text": expr})
@@ -744,7 +768,7 @@ class MCPServer:
         tool_result = result.get("result", {})
         content = tool_result.get("content", tool_result) if isinstance(tool_result, dict) else tool_result
         if isinstance(content, list):
-            mcp_content = content
+            mcp_content = self._normalize_content(content)
         elif isinstance(content, str):
             mcp_content = [{"type": "text", "text": content}]
         else:
